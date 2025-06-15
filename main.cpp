@@ -294,6 +294,10 @@ std::vector<int> load_labels(const std::string& filename, int num_labels) {
     return labels;
 }
 
+# define NOF_TRAIN 5000
+# define NOF_TEST 500
+# define LR 0.01
+
 int main() {
     std::cout << "Fashion-MNIST MLP Classifier" << std::endl;
     std::cout << "=============================" << std::endl;
@@ -302,14 +306,14 @@ int main() {
     std::cout << "Loading training data..." << std::endl;
     // auto train_images = load_images("FMNIST/train-images-idx3-ubyte", 60000);
     // auto train_labels = load_labels("FMNIST/train-labels-idx1-ubyte", 60000);
-    auto train_images = load_images("FMNIST/train-images-idx3-ubyte", 2000);
-    auto train_labels = load_labels("FMNIST/train-labels-idx1-ubyte", 2000);
+    auto train_images = load_images("FMNIST/train-images-idx3-ubyte", NOF_TRAIN);
+    auto train_labels = load_labels("FMNIST/train-labels-idx1-ubyte", NOF_TRAIN);
 
     std::cout << "Loading test data..." << std::endl;
     // auto test_images = load_images("FMNIST/t10k-images-idx3-ubyte", 10000);
     // auto test_labels = load_labels("FMNIST/t10k-labels-idx1-ubyte", 10000);
-    auto test_images = load_images("FMNIST/t10k-images-idx3-ubyte", 500);
-    auto test_labels = load_labels("FMNIST/t10k-labels-idx1-ubyte", 500);
+    auto test_images = load_images("FMNIST/t10k-images-idx3-ubyte", NOF_TEST);
+    auto test_labels = load_labels("FMNIST/t10k-labels-idx1-ubyte", NOF_TEST);
 
     if (train_images.empty() || test_images.empty()) {
         std::cout << "Failed to load data. Please ensure Fashion-MNIST files are in the current directory." << std::endl;
@@ -322,16 +326,22 @@ int main() {
     std::cout << "Test samples: " << test_images.size() << std::endl;
 
     // Base for optimizations - best architecture accuracy
-
-    // 5000 train, 1000 test, final accuracy
+    // 1000 train, 200 test, lr=0.01, final accuracy 84.50% (but very slow)
     // std::vector<int> architecture = {784, 512, 256, 128, 10};
 
-    // 2000 train, 500 test, final accuracy
-    std::vector<int> architecture = {784, 128, 64, 10, 10};
+    // 2000 train, 500 test, lr=0.001, final accuracy 80.2%
+    // std::vector<int> architecture = {784, 128, 64, 10, 10}
 
-    // 1000 train, 200 test, final accuracy 80.5%
+    // 1000 train, 200 test, lr=0.001, final accuracy 80.5%
     // std::vector<int> architecture = {784, 128, 10};
-    MLP network(architecture, 0.001); // Learning rate = 0.001
+
+    // 1000 train, 200 test, lr=0.01, final accuracy 84.50%s
+    // std::vector<int> architecture = {784, 128, 64, 10};
+
+    // 5000 train, 500 test, lr=0.01, final accuracy 86.20%
+    std::vector<int> architecture = {784, 128, 64, 10};
+
+    MLP network(architecture, LR); // Learning rate
 
     std::cout << "\nNetwork Architecture:" << std::endl;
     std::cout << "Input Layer: 784 neurons (28x28 pixels)" << std::endl;
