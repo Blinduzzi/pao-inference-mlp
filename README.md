@@ -1,2 +1,2 @@
-# pao-inference-mlp
-This projects serves the purpose of implementing an inference MLP in C++ in several build interations, starting from a single threaded naive implementation and adding on more and more optimizations.
+# PAO-inference-mlp
+The purpose of this project is to accelerate the training time required for a multilayer perceptron (MLP) to achieve significant classification performance on large datasets. Since all interconnected layers contain associated weights that must be adapted in response to training data features, sequential training becomes computationally intensive and architecture optimization proves time-consuming. Heterogeneous computing has emerged as a promising solution to address these challenges, and this project focuses on both software and hardware approaches for accelerating MLP training and testing processes.
