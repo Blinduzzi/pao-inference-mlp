@@ -17,21 +17,22 @@ private:
     std::vector<int> layer_sizes;
     double learning_rate;
     std::mt19937 rng;
+    int num_threads;
 
     // Activation functions
-    double relu(double x) {
+    inline double relu(double x) {
         return std::max(0.0, x);
     }
 
-    double relu_derivative(double x) {
+    inline double relu_derivative(double x) {
         return x > 0 ? 1.0 : 0.0;
     }
 
-    double sigmoid(double x) {
+    inline double sigmoid(double x) {
         return 1.0 / (1.0 + std::exp(-std::max(-500.0, std::min(500.0, x))));
     }
 
-    double sigmoid_derivative(double x) {
+    inline double sigmoid_derivative(double x) {
         double s = sigmoid(x);
         return s * (1.0 - s);
     }
@@ -61,25 +62,18 @@ private:
         for (size_t i = 0; i < weights.size(); ++i) {
             double xavier_scale = std::sqrt(6.0 / (layer_sizes[i] + layer_sizes[i + 1]));
 
-            #pragma omp parallel num_threads(8)
-            {
-                std::mt19937 local_rng(std::random_device{}() + omp_get_thread_num());
-                std::uniform_real_distribution<double> local_dist(-1.0, 1.0);
-
-                #pragma omp for
-                for (size_t j = 0; j < weights[i].size(); ++j) {
-                    for (size_t k = 0; k < weights[i][j].size(); ++k) {
-                        weights[i][j][k] = local_dist(local_rng) * xavier_scale;
-                    }
-                    biases[i][j] = local_dist(local_rng) * 0.01;
+            for (size_t j = 0; j < weights[i].size(); ++j) {
+                for (size_t k = 0; k < weights[i][j].size(); ++k) {
+                    weights[i][j][k] = dist(rng) * xavier_scale;
                 }
+                biases[i][j] = dist(rng) * 0.01;
             }
         }
     }
 
 public:
-    MLP(const std::vector<int>& sizes, double lr = 0.001)
-        : layer_sizes(sizes), learning_rate(lr), rng(std::random_device{}()) {
+    MLP(const std::vector<int>& sizes, double lr = 0.001, int threads = 8)
+        : layer_sizes(sizes), learning_rate(lr), rng(std::random_device{}()), num_threads(threads) {
 
         // Initialize architecture
         int num_layers = sizes.size();
@@ -105,6 +99,7 @@ public:
         }
 
         initialize_weights();
+        omp_set_num_threads(num_threads);
     }
 
     std::vector<double> forward(const std::vector<double>& input, std::vector<std::vector<double>>& local_activations, std::vector<std::vector<double>>& local_z_values) {
@@ -113,7 +108,6 @@ public:
 
         // Forward propagation through hidden layers
         for (size_t layer = 0; layer < weights.size(); ++layer) {
-            #pragma omp parallel for num_threads(8)
             for (size_t neuron = 0; neuron < weights[layer].size(); ++neuron) {
                 double sum = biases[layer][neuron];
 
@@ -156,14 +150,12 @@ public:
         }
 
         // Calculate output layer deltas (cross-entropy loss with softmax)
-        #pragma omp parallel for num_threads(8)
         for (size_t i = 0; i < local_activations.back().size(); ++i) {
             deltas.back()[i] = local_activations.back()[i] - target[i];
         }
 
         // Backpropagate deltas through hidden layers
         for (int layer = num_layers - 3; layer >= 0; --layer) {
-            #pragma omp parallel for num_threads(8)
             for (int neuron = 0; neuron < layer_sizes[layer + 1]; ++neuron) {
                 double error = 0.0;
 
@@ -177,15 +169,14 @@ public:
 
         // Compute gradients
         for (size_t layer = 0; layer < weights.size(); ++layer) {
-            #pragma omp parallel for num_threads(8)
             for (size_t neuron = 0; neuron < weights[layer].size(); ++neuron) {
                 // Compute bias gradient
-                bias_gradients[layer][neuron] = -learning_rate * deltas[layer][neuron];
+                bias_gradients[layer][neuron] = learning_rate * deltas[layer][neuron];
 
                 // Compute weight gradients
                 for (size_t prev_neuron = 0; prev_neuron < weights[layer][neuron].size(); ++prev_neuron) {
                     weight_gradients[layer][neuron][prev_neuron] =
-                        -learning_rate * deltas[layer][neuron] * local_activations[layer][prev_neuron];
+                        learning_rate * deltas[layer][neuron] * local_activations[layer][prev_neuron];
                 }
             }
         }
@@ -193,7 +184,6 @@ public:
 
     double calculate_loss(const std::vector<double>& output, const std::vector<double>& target) {
         double loss = 0.0;
-        #pragma omp parallel for reduction(+:loss) num_threads(8)
         for (size_t i = 0; i < output.size(); ++i) {
             if (target[i] > 0) {
                 loss -= target[i] * std::log(std::max(output[i], 1e-15));
@@ -214,41 +204,54 @@ public:
                const std::vector<std::vector<double>>& test_data,
                const std::vector<int>& test_labels,
                int epochs, int batch_size = 32) {
-        omp_set_num_threads(8); // Set number of threads for OpenMP
+
         std::vector<int> indices(train_data.size());
         std::iota(indices.begin(), indices.end(), 0);
 
         for (int epoch = 0; epoch < epochs; ++epoch) {
             // Shuffle data for each epoch
             std::shuffle(indices.begin(), indices.end(), rng);
-
             double total_loss = 0.0;
 
-            // Process data in mini-batches
+            // Process data in mini-batches using completely separated thread computation
             for (size_t batch_start = 0; batch_start < train_data.size(); batch_start += batch_size) {
                 size_t batch_end = std::min(batch_start + batch_size, train_data.size());
+                size_t actual_batch_size = batch_end - batch_start;
 
-                // Initialize gradient accumulators
-                std::vector<std::vector<std::vector<double>>> weight_gradients = weights;
-                std::vector<std::vector<double>> bias_gradients = biases;
-                for (auto& layer : weight_gradients) {
-                    for (auto& neuron : layer) {
-                        std::fill(neuron.begin(), neuron.end(), 0.0);
+                // Create separate weight and bias update containers for each thread
+                std::vector<std::vector<std::vector<std::vector<double>>>> thread_weight_updates(num_threads);
+                std::vector<std::vector<std::vector<double>>> thread_bias_updates(num_threads);
+                std::vector<double> thread_losses(num_threads, 0.0);
+                std::vector<int> thread_sample_counts(num_threads, 0);
+
+                // Initialize each thread's update containers
+                for (int t = 0; t < num_threads; ++t) {
+                    thread_weight_updates[t] = weights; // Copy structure
+                    thread_bias_updates[t] = biases;    // Copy structure
+
+                    // Zero out all updates
+                    for (auto& layer : thread_weight_updates[t]) {
+                        for (auto& neuron : layer) {
+                            std::fill(neuron.begin(), neuron.end(), 0.0);
+                        }
+                    }
+                    for (auto& layer : thread_bias_updates[t]) {
+                        std::fill(layer.begin(), layer.end(), 0.0);
                     }
                 }
-                for (auto& layer : bias_gradients) {
-                    std::fill(layer.begin(), layer.end(), 0.0);
-                }
 
-                double batch_loss = 0.0;
-
-                #pragma omp parallel num_threads(8)
+                // Parallel computation with separated threads
+                #pragma omp parallel num_threads(num_threads)
                 {
-                    // Thread-local storage for activations and z_values
+                    int thread_id = omp_get_thread_num();
+
+                    // Each thread gets its own copy of network state
                     std::vector<std::vector<double>> local_activations = activations;
                     std::vector<std::vector<double>> local_z_values = z_values;
                     std::vector<std::vector<std::vector<double>>> local_weight_gradients = weights;
                     std::vector<std::vector<double>> local_bias_gradients = biases;
+
+                    // Zero out gradients
                     for (auto& layer : local_weight_gradients) {
                         for (auto& neuron : layer) {
                             std::fill(neuron.begin(), neuron.end(), 0.0);
@@ -258,9 +261,8 @@ public:
                         std::fill(layer.begin(), layer.end(), 0.0);
                     }
 
-                    double thread_loss = 0.0;
-
-                    #pragma omp for
+                    // Distribute batch samples among threads
+                    #pragma omp for schedule(static)
                     for (size_t i = batch_start; i < batch_end; ++i) {
                         int idx = indices[i];
 
@@ -270,33 +272,68 @@ public:
 
                         // Forward and backward pass
                         std::vector<double> output = forward(train_data[idx], local_activations, local_z_values);
-                        thread_loss += calculate_loss(output, target);
-                        backward(train_data[idx], target, local_activations, local_z_values, local_weight_gradients, local_bias_gradients);
-                    }
+                        thread_losses[thread_id] += calculate_loss(output, target);
+                        thread_sample_counts[thread_id]++;
 
-                    // Accumulate gradients and loss
-                    #pragma omp critical
-                    {
+                        backward(train_data[idx], target, local_activations, local_z_values,
+                                local_weight_gradients, local_bias_gradients);
+
+                        // Accumulate gradients for this thread
                         for (size_t layer = 0; layer < weights.size(); ++layer) {
                             for (size_t neuron = 0; neuron < weights[layer].size(); ++neuron) {
-                                bias_gradients[layer][neuron] += local_bias_gradients[layer][neuron];
+                                thread_bias_updates[thread_id][layer][neuron] += local_bias_gradients[layer][neuron];
                                 for (size_t prev_neuron = 0; prev_neuron < weights[layer][neuron].size(); ++prev_neuron) {
-                                    weight_gradients[layer][neuron][prev_neuron] += local_weight_gradients[layer][neuron][prev_neuron];
+                                    thread_weight_updates[thread_id][layer][neuron][prev_neuron] +=
+                                        local_weight_gradients[layer][neuron][prev_neuron];
                                 }
                             }
                         }
-                        batch_loss += thread_loss;
+
+                        // Reset gradients for next sample
+                        for (auto& layer : local_weight_gradients) {
+                            for (auto& neuron : layer) {
+                                std::fill(neuron.begin(), neuron.end(), 0.0);
+                            }
+                        }
+                        for (auto& layer : local_bias_gradients) {
+                            std::fill(layer.begin(), layer.end(), 0.0);
+                        }
                     }
                 }
 
-                // Apply averaged gradients
-                double batch_scale = 1.0 / (batch_end - batch_start);
+                // Average the updates from all threads (master thread combines results)
+                // This is inspired from reference [3]
+                double batch_loss = 0.0;
+                int total_samples = 0;
+
+                for (int t = 0; t < num_threads; ++t) {
+                    batch_loss += thread_losses[t];
+                    total_samples += thread_sample_counts[t];
+                }
+
+                // Apply averaged weight updates
                 for (size_t layer = 0; layer < weights.size(); ++layer) {
-                    #pragma omp parallel for num_threads(8)
                     for (size_t neuron = 0; neuron < weights[layer].size(); ++neuron) {
-                        biases[layer][neuron] += batch_scale * bias_gradients[layer][neuron];
+                        // Average bias updates from all threads
+                        double avg_bias_update = 0.0;
+                        for (int t = 0; t < num_threads; ++t) {
+                            if (thread_sample_counts[t] > 0) {
+                                avg_bias_update += thread_bias_updates[t][layer][neuron] / thread_sample_counts[t];
+                            }
+                        }
+                        avg_bias_update /= num_threads;
+                        biases[layer][neuron] -= avg_bias_update;
+
+                        // Average weight updates from all threads
                         for (size_t prev_neuron = 0; prev_neuron < weights[layer][neuron].size(); ++prev_neuron) {
-                            weights[layer][neuron][prev_neuron] += batch_scale * weight_gradients[layer][neuron][prev_neuron];
+                            double avg_weight_update = 0.0;
+                            for (int t = 0; t < num_threads; ++t) {
+                                if (thread_sample_counts[t] > 0) {
+                                    avg_weight_update += thread_weight_updates[t][layer][neuron][prev_neuron] / thread_sample_counts[t];
+                                }
+                            }
+                            avg_weight_update /= num_threads;
+                            weights[layer][neuron][prev_neuron] -= avg_weight_update;
                         }
                     }
                 }
@@ -304,10 +341,10 @@ public:
                 total_loss += batch_loss;
             }
 
-            // Print progress every 5 epochs
-            // if ((epoch + 1) % 5 == 0) {
+            // Print progress every 10 epochs
+            // if ((epoch + 1) % 10 == 0) {
             //     int correct = 0;
-            //     #pragma omp parallel for reduction(+:correct) num_threads(8)
+            //     #pragma omp parallel for reduction(+:correct) num_threads(num_threads)
             //     for (size_t i = 0; i < test_data.size(); ++i) {
             //         if (predict(test_data[i]) == test_labels[i]) {
             //             correct++;
@@ -377,10 +414,11 @@ std::vector<int> load_labels(const std::string& filename, int num_labels) {
 # define LR 0.01
 # define EPOCHS 50
 # define BATCH_SIZE 32
+# define NUM_THREADS 8
 
 int main() {
-    std::cout << "Fashion-MNIST MLP Classifier (Optimized with OpenMP)" << std::endl;
-    std::cout << "===================================================" << std::endl;
+    std::cout << "Fashion-MNIST MLP Classifier (Optimized with Separated Thread OpenMP)" << std::endl;
+    std::cout << "======================================================================" << std::endl;
 
     // Fashion-MNIST class names
     std::vector<std::string> class_names = {
@@ -414,7 +452,7 @@ int main() {
 
     std::vector<int> architecture = {784, 128, 64, 10};
 
-    MLP network(architecture, LR);
+    MLP network(architecture, LR, NUM_THREADS);
 
     std::cout << "\nNetwork Architecture:" << std::endl;
     std::cout << "Input Layer: 784 neurons (28x28 pixels)" << std::endl;
@@ -422,6 +460,7 @@ int main() {
         std::cout << "Hidden Layer " << i << ": " << architecture[i] << " neurons (ReLU)" << std::endl;
     }
     std::cout << "Output Layer: 10 neurons (Softmax)" << std::endl;
+    std::cout << "Using " << NUM_THREADS << " OpenMP threads" << std::endl;
 
     std::cout << "\nStarting training..." << std::endl;
 
@@ -440,7 +479,7 @@ int main() {
 
     // Final evaluation
     int correct = 0;
-    #pragma omp parallel for reduction(+:correct) num_threads(8)
+    #pragma omp parallel for reduction(+:correct) num_threads(NUM_THREADS)
     for (size_t i = 0; i < test_images.size(); ++i) {
         if (network.predict(test_images[i]) == test_labels[i]) {
             correct++;
@@ -454,8 +493,8 @@ int main() {
     return 0;
 }
 /*
-Fashion-MNIST MLP Classifier (Optimized with OpenMP)
-===================================================
+Fashion-MNIST MLP Classifier (Optimized with Separated Thread OpenMP)
+======================================================================
 
 Class Labels:
 0: T-shirt/top
@@ -479,22 +518,18 @@ Input Layer: 784 neurons (28x28 pixels)
 Hidden Layer 1: 128 neurons (ReLU)
 Hidden Layer 2: 64 neurons (ReLU)
 Output Layer: 10 neurons (Softmax)
+Using 8 OpenMP threads
 
 Starting training...
-Epoch   5 | Loss: 1.0210 | Test Accuracy: 70.00%
-Epoch  10 | Loss: 0.7807 | Test Accuracy: 73.60%
-Epoch  15 | Loss: 0.6818 | Test Accuracy: 75.40%
-Epoch  20 | Loss: 0.6166 | Test Accuracy: 78.60%
-Epoch  25 | Loss: 0.5745 | Test Accuracy: 79.40%
-Epoch  30 | Loss: 0.5434 | Test Accuracy: 79.20%
-Epoch  35 | Loss: 0.5129 | Test Accuracy: 78.80%
-Epoch  40 | Loss: 0.4966 | Test Accuracy: 79.40%
-Epoch  45 | Loss: 0.4763 | Test Accuracy: 81.00%
-Epoch  50 | Loss: 0.4575 | Test Accuracy: 82.60%
+Epoch  10 | Loss: 0.5121 | Test Accuracy: 82.40%
+Epoch  20 | Loss: 0.4177 | Test Accuracy: 82.80%
+Epoch  30 | Loss: 0.3620 | Test Accuracy: 85.40%
+Epoch  40 | Loss: 0.3194 | Test Accuracy: 83.40%
+Epoch  50 | Loss: 0.2870 | Test Accuracy: 85.60%
 
 Training completed!
-Total training time: 113.064 seconds
-Average time per epoch: 2.261 seconds
+Total training time: 86.529 seconds
+Average time per epoch: 1.731 seconds
 
-Final Test Accuracy: 82.60%
+Final Test Accuracy: 85.60%
 */
