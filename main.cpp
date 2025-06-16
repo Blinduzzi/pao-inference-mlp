@@ -5,6 +5,7 @@
 #include <fstream>
 #include <algorithm>
 #include <iomanip>
+#include <chrono>
 
 class MLP {
 private:
@@ -194,57 +195,47 @@ public:
                const std::vector<int>& train_labels,
                const std::vector<std::vector<double>>& test_data,
                const std::vector<int>& test_labels,
-               int epochs, int batch_size = 32) {
+               int epochs) {
 
         std::vector<int> indices(train_data.size());
         std::iota(indices.begin(), indices.end(), 0);
 
         for (int epoch = 0; epoch < epochs; ++epoch) {
-            // Shuffle data
+            // Shuffle data for each epoch
             std::shuffle(indices.begin(), indices.end(), rng);
 
             double total_loss = 0.0;
-            int num_batches = (train_data.size() + batch_size - 1) / batch_size;
 
-            // Mini-batch training
-            for (int batch = 0; batch < num_batches; ++batch) {
-                int batch_start = batch * batch_size;
-                int batch_end = std::min(batch_start + batch_size, (int)train_data.size());
+            // Sequential training - process each sample individually
+            for (size_t i = 0; i < train_data.size(); ++i) {
+                int idx = indices[i];
 
-                double batch_loss = 0.0;
+                // Create one-hot encoded target
+                std::vector<double> target(10, 0.0);
+                target[train_labels[idx]] = 1.0;
 
-                for (int i = batch_start; i < batch_end; ++i) {
-                    int idx = indices[i];
-
-                    // Create one-hot encoded target
-                    std::vector<double> target(10, 0.0);
-                    target[train_labels[idx]] = 1.0;
-
-                    // Forward and backward pass
-                    std::vector<double> output = forward(train_data[idx]);
-                    batch_loss += calculate_loss(output, target);
-                    backward(target);
-                }
-
-                total_loss += batch_loss;
+                // Forward and backward pass for each sample
+                std::vector<double> output = forward(train_data[idx]);
+                total_loss += calculate_loss(output, target);
+                backward(target);
             }
 
-            // Calculate accuracy on test set every 5 epochs
-            if ((epoch + 1) % 5 == 0) {
-                int correct = 0;
-                for (size_t i = 0; i < test_data.size(); ++i) {
-                    if (predict(test_data[i]) == test_labels[i]) {
-                        correct++;
-                    }
-                }
-
-                double accuracy = 100.0 * correct / test_data.size();
-                double avg_loss = total_loss / train_data.size();
-
-                std::cout << "Epoch " << std::setw(3) << epoch + 1
-                         << " | Loss: " << std::fixed << std::setprecision(4) << avg_loss
-                         << " | Test Accuracy: " << std::setprecision(2) << accuracy << "%" << std::endl;
-            }
+            // // Calculate accuracy on test set every 5 epochs -- Used in finding optimal architectures
+            // if ((epoch + 1) % 5 == 0) {
+            //     int correct = 0;
+            //     for (size_t i = 0; i < test_data.size(); ++i) {
+            //         if (predict(test_data[i]) == test_labels[i]) {
+            //             correct++;
+            //         }
+            //     }
+            //
+            //     double accuracy = 100.0 * correct / test_data.size();
+            //     double avg_loss = total_loss / train_data.size();
+            //
+            //     std::cout << "Epoch " << std::setw(3) << epoch + 1
+            //              << " | Loss: " << std::fixed << std::setprecision(4) << avg_loss
+            //              << " | Test Accuracy: " << std::setprecision(2) << accuracy << "%" << std::endl;
+            // }
         }
     }
 };
@@ -298,9 +289,22 @@ std::vector<int> load_labels(const std::string& filename, int num_labels) {
 # define NOF_TEST 500
 # define LR 0.01
 
+# define EPOCHS 50
+
 int main() {
     std::cout << "Fashion-MNIST MLP Classifier" << std::endl;
     std::cout << "=============================" << std::endl;
+
+    // Fashion-MNIST class names
+    std::vector<std::string> class_names = {
+        "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
+        "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"
+    };
+
+    std::cout << "\nClass Labels:" << std::endl;
+    for (int i = 0; i < 10; ++i) {
+        std::cout << i << ": " << class_names[i] << std::endl;
+    }
 
     // Load Fashion-MNIST data
     std::cout << "Loading training data..." << std::endl;
@@ -351,7 +355,19 @@ int main() {
     std::cout << "Output Layer: 10 neurons (Softmax)" << std::endl;
 
     std::cout << "\nStarting training..." << std::endl;
-    network.train(train_images, train_labels, test_images, test_labels, 50, 64);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    network.train(train_images, train_labels, test_images, test_labels, EPOCHS);
+    auto stop = std::chrono::high_resolution_clock::now();
+
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
+    double seconds = duration.count() / 1000.0;
+
+    std::cout << "\nTraining completed!" << std::endl;
+    std::cout << "Total training time: " << std::fixed << std::setprecision(3)
+              << seconds << " seconds" << std::endl;
+    std::cout << "Average time per epoch: " << std::fixed << std::setprecision(3)
+              << seconds / EPOCHS << " seconds" << std::endl;
 
     // Final evaluation
     int correct = 0;
@@ -364,17 +380,6 @@ int main() {
     double final_accuracy = 100.0 * correct / test_images.size();
     std::cout << "\nFinal Test Accuracy: " << std::fixed << std::setprecision(2)
               << final_accuracy << "%" << std::endl;
-
-    // Fashion-MNIST class names
-    std::vector<std::string> class_names = {
-        "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
-        "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"
-    };
-
-    std::cout << "\nClass Labels:" << std::endl;
-    for (int i = 0; i < 10; ++i) {
-        std::cout << i << ": " << class_names[i] << std::endl;
-    }
     
     return 0;
 }
