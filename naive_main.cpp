@@ -383,3 +383,40 @@ int main() {
     
     return 0;
 }
+/*
+Intel(R) Core(TM) i5-9300H CPU @ 2.40GHz
+
+Fashion-MNIST MLP Classifier
+=============================
+
+Class Labels:
+0: T-shirt/top
+1: Trouser
+2: Pullover
+3: Dress
+4: Coat
+5: Sandal
+6: Shirt
+7: Sneaker
+8: Bag
+9: Ankle boot
+Loading training data...
+Loading test data...
+Data loaded successfully!
+Training samples: 5000
+Test samples: 500
+
+Network Architecture:
+Input Layer: 784 neurons (28x28 pixels)
+Hidden Layer 1: 128 neurons (ReLU)
+Hidden Layer 2: 64 neurons (ReLU)
+Output Layer: 10 neurons (Softmax)
+
+Starting training...
+
+Training completed!
+Total training time: 937.104 seconds
+Average time per epoch: 18.742 seconds
+
+Final Test Accuracy: 87.00%
+*/
