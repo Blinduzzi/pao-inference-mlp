@@ -302,7 +302,7 @@ public:
                 }
 
                 // Average the updates from all threads (master thread combines results)
-                // This is inspired from reference [3]
+                // This is inspired from reference [8]
                 double batch_loss = 0.0;
                 int total_samples = 0;
 
@@ -532,4 +532,6 @@ Total training time: 86.529 seconds
 Average time per epoch: 1.731 seconds
 
 Final Test Accuracy: 85.60%
+
+g++ -fopenmp -O3 openmp_main.cpp -o openmp_main
 */

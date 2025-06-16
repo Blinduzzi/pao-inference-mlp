@@ -419,4 +419,6 @@ Total training time: 937.104 seconds
 Average time per epoch: 18.742 seconds
 
 Final Test Accuracy: 87.00%
+
+g++ -O0 naive_main.cpp -o naive_main
 */
