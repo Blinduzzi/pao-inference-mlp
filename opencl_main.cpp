@@ -24,9 +24,9 @@ using namespace std;
 // Configuration constants
 #define NOF_TRAIN 5000
 #define NOF_TEST 500
-#define LR 0.01f
+#define LR 0.01f  // Consider reducing to 0.005f for float precision
 #define EPOCHS 50
-#define BATCH_SIZE 64  // Larger batch for GPU efficiency
+#define BATCH_SIZE 32  // Match AVX batch size
 
 // Helper function to check OpenCL errors
 #define cl_check(result) { if (result != CL_SUCCESS) { \
@@ -104,6 +104,11 @@ public:
         // Free aligned memory
         for (auto* ptr : weights) aligned_free(ptr);
         for (auto* ptr : biases) aligned_free(ptr);
+    }
+
+    // Public getter for layer sizes
+    const vector<int>& getLayerSizes() const {
+        return layer_sizes;
     }
 
 private:
@@ -311,17 +316,19 @@ __kernel void compute_deltas(
     float delta = 0.0f;
 
     if (is_output_layer) {
-        // Output layer: compute softmax derivative
+        // Output layer: compute softmax derivative (activation - target)
         float target = targets[batch_idx * layer_size + neuron_idx];
         delta = activation - target;
     } else {
-        // Hidden layer: compute derivative using next layer
+        // Hidden layer: compute derivative using next layer weights and deltas
+        float sum = 0.0f;
         for (int i = 0; i < next_layer_size; i++) {
-            delta += next_deltas[batch_idx * next_layer_size + i] *
-                     weights[i * layer_size + neuron_idx];
+            float next_delta = next_deltas[batch_idx * next_layer_size + i];
+            float weight = weights[i * layer_size + neuron_idx];
+            sum += next_delta * weight;
         }
-        // ReLU derivative
-        if (activation <= 0.0f) delta = 0.0f;
+        // Apply ReLU derivative (derivative is 1 if activation > 0, 0 otherwise)
+        delta = (activation > 0.0f) ? sum : 0.0f;
     }
 
     deltas[idx] = delta;
@@ -518,14 +525,78 @@ public:
             auto epoch_end = high_resolution_clock::now();
             auto epoch_time = duration_cast<milliseconds>(epoch_end - epoch_start);
 
-            if (epoch % 5 == 0) {
-                double accuracy = evaluate(test_data, test_labels);
-                cout << "Epoch " << epoch + 1 << "/" << epochs
-                     << " - Loss: " << fixed << setprecision(4) << total_loss / batches_processed
-                     << " - Accuracy: " << fixed << setprecision(2) << accuracy << "%"
-                     << " - Time: " << epoch_time.count() << "ms" << endl;
+            // if (epoch % 5 == 0) {
+            //     double accuracy = evaluate(test_data, test_labels);
+            //     cout << "Epoch " << epoch + 1 << "/" << epochs
+            //          << " - Loss: " << fixed << setprecision(4) << total_loss / batches_processed
+            //          << " - Accuracy: " << fixed << setprecision(2) << accuracy << "%"
+            //          << " - Time: " << epoch_time.count() << "ms" << endl;
+            // }
+        }
+    }
+
+    vector<float> predict(const vector<float>& batch_inputs, size_t batch_size) {
+        cl_int err;
+
+        // Upload inputs
+        err = queue.enqueueWriteBuffer(activation_buffers[0], CL_TRUE, 0,
+                                     batch_inputs.size() * sizeof(float),
+                                     batch_inputs.data());
+        cl_check(err);
+
+        // Forward pass (simplified version)
+        for (size_t layer = 0; layer < layer_sizes.size() - 1; layer++) {
+            // Set kernel arguments
+            forward_kernel.setArg(0, activation_buffers[layer]);
+            forward_kernel.setArg(1, weight_buffers[layer]);
+            forward_kernel.setArg(2, bias_buffers[layer]);
+            forward_kernel.setArg(3, activation_buffers[layer + 1]);
+            forward_kernel.setArg(4, (int)batch_size);
+            forward_kernel.setArg(5, layer_sizes[layer]);
+            forward_kernel.setArg(6, layer_sizes[layer + 1]);
+
+            // Execute kernel
+            size_t global_work_size = batch_size * layer_sizes[layer + 1];
+            err = queue.enqueueNDRangeKernel(forward_kernel, cl::NullRange,
+                                           cl::NDRange(global_work_size), cl::NullRange);
+            cl_check(err);
+
+            // Apply activation
+            if (layer < layer_sizes.size() - 2) {
+                size_t activation_size = batch_size * layer_sizes[layer + 1];
+                relu_kernel.setArg(0, activation_buffers[layer + 1]);
+                relu_kernel.setArg(1, (int)activation_size);
+
+                err = queue.enqueueNDRangeKernel(relu_kernel, cl::NullRange,
+                                               cl::NDRange(activation_size), cl::NullRange);
+                cl_check(err);
+            } else {
+                // Apply softmax for output layer
+                size_t max_work_group_size = static_cast<size_t>(device.getInfo<CL_DEVICE_MAX_WORK_GROUP_SIZE>());
+                size_t local_work_size = min(static_cast<size_t>(64), max_work_group_size);
+
+                softmax_kernel.setArg(0, activation_buffers[layer + 1]);
+                softmax_kernel.setArg(1, cl::Local(local_work_size * sizeof(float)));
+                softmax_kernel.setArg(2, cl::Local(local_work_size * sizeof(float)));
+                softmax_kernel.setArg(3, (int)batch_size);
+                softmax_kernel.setArg(4, layer_sizes[layer + 1]);
+
+                err = queue.enqueueNDRangeKernel(softmax_kernel, cl::NullRange,
+                                               cl::NDRange(batch_size * local_work_size),
+                                               cl::NDRange(local_work_size));
+                cl_check(err);
             }
         }
+
+        queue.finish();
+
+        // Download results
+        vector<float> results(batch_size * layer_sizes.back());
+        err = queue.enqueueReadBuffer(activation_buffers.back(), CL_TRUE, 0,
+                                    results.size() * sizeof(float), results.data());
+        cl_check(err);
+
+        return results;
     }
 
 private:
@@ -598,28 +669,42 @@ private:
                                      targets.size() * sizeof(float), targets.data());
         cl_check(err);
 
-        // Backward pass
+        // Backward pass - compute deltas layer by layer
         for (int layer = layer_sizes.size() - 2; layer >= 0; layer--) {
             int is_output_layer = (layer == layer_sizes.size() - 2) ? 1 : 0;
-            int next_layer_size = (layer < layer_sizes.size() - 2) ? layer_sizes[layer + 2] : 0;
 
-            // Compute deltas
-            backward_kernel.setArg(0, activation_buffers[layer + 1]);
-            backward_kernel.setArg(1, target_buffer);
-            backward_kernel.setArg(2, (layer < layer_sizes.size() - 2) ? weight_buffers[layer + 1] : weight_buffers[layer]);
-            backward_kernel.setArg(3, (layer < layer_sizes.size() - 2) ? delta_buffers[layer + 2] : delta_buffers[layer + 1]);
-            backward_kernel.setArg(4, delta_buffers[layer + 1]);
-            backward_kernel.setArg(5, (int)batch_size);
-            backward_kernel.setArg(6, layer_sizes[layer + 1]);
-            backward_kernel.setArg(7, next_layer_size);
-            backward_kernel.setArg(8, is_output_layer);
+            if (is_output_layer) {
+                // Output layer: compute softmax derivative
+                backward_kernel.setArg(0, activation_buffers[layer + 1]);
+                backward_kernel.setArg(1, target_buffer);
+                backward_kernel.setArg(2, weight_buffers[0]); // dummy, not used for output layer
+                backward_kernel.setArg(3, delta_buffers[0]); // dummy, not used for output layer
+                backward_kernel.setArg(4, delta_buffers[layer + 1]);
+                backward_kernel.setArg(5, (int)batch_size);
+                backward_kernel.setArg(6, layer_sizes[layer + 1]);
+                backward_kernel.setArg(7, 0); // not used for output layer
+                backward_kernel.setArg(8, 1); // is_output_layer = true
+            } else {
+                // Hidden layer
+                backward_kernel.setArg(0, activation_buffers[layer + 1]);
+                backward_kernel.setArg(1, target_buffer); // not used for hidden layers
+                backward_kernel.setArg(2, weight_buffers[layer + 1]);
+                backward_kernel.setArg(3, delta_buffers[layer + 2]);
+                backward_kernel.setArg(4, delta_buffers[layer + 1]);
+                backward_kernel.setArg(5, (int)batch_size);
+                backward_kernel.setArg(6, layer_sizes[layer + 1]);
+                backward_kernel.setArg(7, layer_sizes[layer + 2]);
+                backward_kernel.setArg(8, 0); // is_output_layer = false
+            }
 
             size_t global_work_size[2] = {batch_size, static_cast<size_t>(layer_sizes[layer + 1])};
             err = queue.enqueueNDRangeKernel(backward_kernel, cl::NullRange,
                                            cl::NDRange(global_work_size[0], global_work_size[1]), cl::NullRange);
             cl_check(err);
+        }
 
-            // Update weights
+        // Update weights for all layers
+        for (int layer = 0; layer < layer_sizes.size() - 1; layer++) {
             update_weights_kernel.setArg(0, weight_buffers[layer]);
             update_weights_kernel.setArg(1, bias_buffers[layer]);
             update_weights_kernel.setArg(2, activation_buffers[layer]);
@@ -689,70 +774,6 @@ private:
         }
 
         return 100.0 * correct / test_data.size();
-    }
-
-    vector<float> predict(const vector<float>& batch_inputs, size_t batch_size) {
-        cl_int err;
-
-        // Upload inputs
-        err = queue.enqueueWriteBuffer(activation_buffers[0], CL_TRUE, 0,
-                                     batch_inputs.size() * sizeof(float),
-                                     batch_inputs.data());
-        cl_check(err);
-
-        // Forward pass (simplified version)
-        for (size_t layer = 0; layer < layer_sizes.size() - 1; layer++) {
-            // Set kernel arguments
-            forward_kernel.setArg(0, activation_buffers[layer]);
-            forward_kernel.setArg(1, weight_buffers[layer]);
-            forward_kernel.setArg(2, bias_buffers[layer]);
-            forward_kernel.setArg(3, activation_buffers[layer + 1]);
-            forward_kernel.setArg(4, (int)batch_size);
-            forward_kernel.setArg(5, layer_sizes[layer]);
-            forward_kernel.setArg(6, layer_sizes[layer + 1]);
-
-            // Execute kernel
-            size_t global_work_size = batch_size * layer_sizes[layer + 1];
-            err = queue.enqueueNDRangeKernel(forward_kernel, cl::NullRange,
-                                           cl::NDRange(global_work_size), cl::NullRange);
-            cl_check(err);
-
-            // Apply activation
-            if (layer < layer_sizes.size() - 2) {
-                size_t activation_size = batch_size * layer_sizes[layer + 1];
-                relu_kernel.setArg(0, activation_buffers[layer + 1]);
-                relu_kernel.setArg(1, (int)activation_size);
-
-                err = queue.enqueueNDRangeKernel(relu_kernel, cl::NullRange,
-                                               cl::NDRange(activation_size), cl::NullRange);
-                cl_check(err);
-            } else {
-                // Apply softmax for output layer
-                size_t max_work_group_size = static_cast<size_t>(device.getInfo<CL_DEVICE_MAX_WORK_GROUP_SIZE>());
-                size_t local_work_size = min(static_cast<size_t>(64), max_work_group_size);
-
-                softmax_kernel.setArg(0, activation_buffers[layer + 1]);
-                softmax_kernel.setArg(1, cl::Local(local_work_size * sizeof(float)));
-                softmax_kernel.setArg(2, cl::Local(local_work_size * sizeof(float)));
-                softmax_kernel.setArg(3, (int)batch_size);
-                softmax_kernel.setArg(4, layer_sizes[layer + 1]);
-
-                err = queue.enqueueNDRangeKernel(softmax_kernel, cl::NullRange,
-                                               cl::NDRange(batch_size * local_work_size),
-                                               cl::NDRange(local_work_size));
-                cl_check(err);
-            }
-        }
-
-        queue.finish();
-
-        // Download results
-        vector<float> results(batch_size * layer_sizes.back());
-        err = queue.enqueueReadBuffer(activation_buffers.back(), CL_TRUE, 0,
-                                    results.size() * sizeof(float), results.data());
-        cl_check(err);
-
-        return results;
     }
 };
 
@@ -898,6 +919,47 @@ int main() {
         cout << "Average time per epoch: " << fixed << setprecision(3)
              << seconds / EPOCHS << " seconds" << endl;
 
+        // Final evaluation on test set
+        cout << "\nEvaluating final performance..." << endl;
+        int correct = 0;
+        const vector<int>& layer_sizes = network.getLayerSizes();
+
+        // Process test data in batches for final evaluation
+        for (size_t i = 0; i < test_images.size(); i += BATCH_SIZE) {
+            size_t batch_end = min(i + BATCH_SIZE, test_images.size());
+            size_t batch_size = batch_end - i;
+
+            vector<float> batch_inputs(batch_size * layer_sizes[0]);
+            for (size_t j = 0; j < batch_size; j++) {
+                copy(test_images[i + j].begin(), test_images[i + j].end(),
+                     batch_inputs.begin() + j * layer_sizes[0]);
+            }
+
+            // Get predictions
+            vector<float> predictions = network.predict(batch_inputs, batch_size);
+
+            // Count correct predictions
+            for (size_t j = 0; j < batch_size; j++) {
+                int predicted_class = 0;
+                float max_prob = predictions[j * layer_sizes.back()];
+
+                for (int k = 1; k < layer_sizes.back(); k++) {
+                    if (predictions[j * layer_sizes.back() + k] > max_prob) {
+                        max_prob = predictions[j * layer_sizes.back() + k];
+                        predicted_class = k;
+                    }
+                }
+
+                if (predicted_class == test_labels[i + j]) {
+                    correct++;
+                }
+            }
+        }
+
+        double final_accuracy = 100.0 * correct / test_images.size();
+        cout << "\nFinal Test Accuracy: " << fixed << setprecision(2)
+             << final_accuracy << "%" << endl;
+
     } catch (const exception& e) {
         cerr << "Error: " << e.what() << endl;
         return 1;
@@ -905,6 +967,7 @@ int main() {
 
     return 0;
 }
+
 /*
 Fashion-MNIST MLP Classifier (OpenCL Optimized)
 ===============================================
@@ -939,22 +1002,16 @@ Input Layer: 784 neurons (28x28 pixels)
 Hidden Layer 1: 128 neurons (ReLU)
 Hidden Layer 2: 64 neurons (ReLU)
 Output Layer: 10 neurons (Softmax)
-Batch size: 64 (optimized for GPU)
+Batch size: 32 (optimized for GPU)
 
 Starting training...
 Starting OpenCL training with optimized kernels...
-Epoch 1/50 - Loss: 1.9893 - Accuracy: 62.80% - Time: 79ms
-Epoch 6/50 - Loss: 0.7457 - Accuracy: 73.60% - Time: 70ms
-Epoch 11/50 - Loss: 0.6030 - Accuracy: 75.00% - Time: 66ms
-Epoch 16/50 - Loss: 0.5360 - Accuracy: 73.60% - Time: 66ms
-Epoch 21/50 - Loss: 0.4884 - Accuracy: 81.00% - Time: 63ms
-Epoch 26/50 - Loss: 0.4669 - Accuracy: 75.40% - Time: 66ms
-Epoch 31/50 - Loss: 0.4406 - Accuracy: 77.20% - Time: 65ms
-Epoch 36/50 - Loss: 0.4226 - Accuracy: 81.00% - Time: 64ms
-Epoch 41/50 - Loss: 0.4104 - Accuracy: 73.40% - Time: 65ms
-Epoch 46/50 - Loss: 0.4083 - Accuracy: 75.60% - Time: 63ms
 
 Training completed!
-Total training time: 3.512 seconds
-Average time per epoch: 0.070 seconds
+Total training time: 4.207 seconds
+Average time per epoch: 0.084 seconds
+
+Evaluating final performance...
+
+Final Test Accuracy: 86.40%
 */
